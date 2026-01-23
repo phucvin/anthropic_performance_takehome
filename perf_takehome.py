@@ -263,24 +263,29 @@ class KernelBuilder:
 
         body = []
 
-        # Hoisted arrays
-        hoisted_idx = [self.alloc_scratch(f"h_idx_{i}", VLEN) for i in range(0, batch_size, VLEN)]
-        hoisted_val = [self.alloc_scratch(f"h_val_{i}", VLEN) for i in range(0, batch_size, VLEN)]
+        # Tiling Configuration
+        # batch_size = 256
+        # VLEN = 8
+        # total_vecs = 32
+        TILE_VECS = 16 # Process 16 vectors (128 items) per tile
 
+        hoisted_idx = [self.alloc_scratch(f"h_idx_{i}", VLEN) for i in range(TILE_VECS)]
+        hoisted_val = [self.alloc_scratch(f"h_val_{i}", VLEN) for i in range(TILE_VECS)]
+
+        # Pointers for loading/storing
         curr_indices_p = self.alloc_scratch("curr_indices_p")
         curr_values_p = self.alloc_scratch("curr_values_p")
+        store_indices_p = self.alloc_scratch("store_indices_p")
+        store_values_p = self.alloc_scratch("store_values_p")
 
-        # Hoist Loads
+        # Initialize pointers
         body.append(("flow", ("add_imm", curr_indices_p, self.scratch["inp_indices_p"], 0)))
         body.append(("flow", ("add_imm", curr_values_p, self.scratch["inp_values_p"], 0)))
-        for i in range(len(hoisted_idx)):
-             body.append(("load", ("vload", hoisted_idx[i], curr_indices_p)))
-             body.append(("load", ("vload", hoisted_val[i], curr_values_p)))
-             body.append(("flow", ("add_imm", curr_indices_p, curr_indices_p, VLEN)))
-             body.append(("flow", ("add_imm", curr_values_p, curr_values_p, VLEN)))
+        body.append(("flow", ("add_imm", store_indices_p, self.scratch["inp_indices_p"], 0)))
+        body.append(("flow", ("add_imm", store_values_p, self.scratch["inp_values_p"], 0)))
 
         # Pre-allocate unique temps per chunk (reusing sets to save scratch)
-        NUM_SETS = 3
+        NUM_SETS = 8
         temp_sets = []
         for s in range(NUM_SETS):
              t = {}
@@ -290,124 +295,111 @@ class KernelBuilder:
              t['v_tmp2'] = self.alloc_scratch(f"v_tmp2_s{s}", VLEN)
              t['v_tmp3'] = self.alloc_scratch(f"v_tmp3_s{s}", VLEN)
              t['v_offset'] = self.alloc_scratch(f"v_offset_s{s}", VLEN)
-             t['v_bits'] = [self.alloc_scratch(f"v_bit_{d}_s{s}", VLEN) for d in range(CACHE_LEVELS)]
+             t['v_bits'] = self.alloc_scratch(f"v_bit_s{s}", VLEN)
 
-             t_tree = []
-             for d in range(CACHE_LEVELS):
-                 layer_width = 2**(CACHE_LEVELS - 1 - d)
-                 layer = [self.alloc_scratch(f"tree_tmp_{d}_{j}_s{s}", VLEN) for j in range(layer_width)]
-                 t_tree.append(layer)
-             t['tree_temps'] = t_tree
+             max_width = 2**(CACHE_LEVELS - 1) if CACHE_LEVELS > 0 else 0
+             t['tree_temps'] = [self.alloc_scratch(f"tree_tmp_{j}_s{s}", VLEN) for j in range(max_width)]
              temp_sets.append(t)
 
-        chunk_temps = [temp_sets[i % NUM_SETS] for i in range(len(hoisted_idx))]
+        chunk_temps = [temp_sets[i % NUM_SETS] for i in range(TILE_VECS)]
 
         # Pre-allocate broadcast temps
         max_level_nodes = int(2**(CACHE_LEVELS - 1)) if CACHE_LEVELS > 0 else 0
         broadcast_temps = [self.alloc_scratch(f"bc_tmp_{n}", VLEN) for n in range(max_level_nodes)]
 
-        for round in range(rounds):
-            level = round % (forest_height + 1)
-            is_cached = level < CACHE_LEVELS
+        # Tile Loop
+        total_vecs = batch_size // VLEN
+        for t_start in range(0, total_vecs, TILE_VECS):
+            current_tile_size = min(TILE_VECS, total_vecs - t_start)
 
-            if is_cached:
-                 start_node = 2**level - 1
-                 v_start_node = self.scratch_const_vec(start_node)
-                 level_base = forest_scratch_base + start_node
+            # Load Tile
+            for i in range(current_tile_size):
+                 body.append(("load", ("vload", hoisted_idx[i], curr_indices_p)))
+                 body.append(("load", ("vload", hoisted_val[i], curr_values_p)))
+                 body.append(("flow", ("add_imm", curr_indices_p, curr_indices_p, VLEN)))
+                 body.append(("flow", ("add_imm", curr_values_p, curr_values_p, VLEN)))
 
-                 level_vecs = []
-                 for n in range(2**level):
-                     v = broadcast_temps[n]
-                     body.append(("valu", ("vbroadcast", v, level_base + n)))
-                     level_vecs.append(v)
-
-            for i in range(len(hoisted_idx)):
-                v_idx_curr = hoisted_idx[i]
-                v_val_curr = hoisted_val[i]
-                temps = chunk_temps[i]
-                v_node_val = temps['v_node_val']
-                v_addr = temps['v_addr']
-                v_tmp1 = temps['v_tmp1']
-                v_tmp2 = temps['v_tmp2']
-                v_tmp3 = temps['v_tmp3']
+            for round in range(rounds):
+                level = round % (forest_height + 1)
+                is_cached = level < CACHE_LEVELS
 
                 if is_cached:
-                    v_offset = temps['v_offset']
-                    v_bits = temps['v_bits']
-                    tree_temps = temps['tree_temps']
-                    # offset = idx - start_node
-                    body.append(("valu", ("-", v_offset, v_idx_curr, v_start_node)))
+                     start_node = 2**level - 1
+                     v_start_node = self.scratch_const_vec(start_node)
+                     level_base = forest_scratch_base + start_node
 
-                    # Extract bits?
-                    # vselect(cond, a, b). cond != 0 -> a.
-                    # bits: bit 0 selects between pairs.
-                    # bit k selects at layer k.
-                    # We need bits 0..level-1.
-                    # bit j = (offset >> j) & 1.
+                     level_vecs = []
+                     for n in range(2**level):
+                         v = broadcast_temps[n]
+                         body.append(("valu", ("vbroadcast", v, level_base + n)))
+                         level_vecs.append(v)
 
-                    # Since we do this for each batch, we compute bits for each batch.
-                    # But we can reuse v_bits scratch?
+                for i in range(current_tile_size):
+                    v_idx_curr = hoisted_idx[i]
+                    v_val_curr = hoisted_val[i]
+                    temps = chunk_temps[i]
+                    v_node_val = temps['v_node_val']
+                    v_addr = temps['v_addr']
+                    v_tmp1 = temps['v_tmp1']
+                    v_tmp2 = temps['v_tmp2']
+                    v_tmp3 = temps['v_tmp3']
 
-                    # Tree construction
-                    current_layer = level_vecs
-                    for d in range(level):
-                        # Extract bit d
-                        v_bit = v_bits[d]
-                        # bit = (offset >> d) & 1
-                        # We need constant vector for d? No, shift by constant.
-                        # shift vector?
-                        # valu ">>", dest, src, shift_amt (vector).
-                        # We need shift_amt vector.
-                        v_shift = self.scratch_const_vec(d)
-                        body.append(("valu", (">>", v_bit, v_offset, v_shift)))
-                        # & 1
-                        body.append(("valu", ("&", v_bit, v_bit, v_one)))
+                    if is_cached:
+                        v_offset = temps['v_offset']
+                        v_bits = temps['v_bits']
+                        tree_temps = temps['tree_temps']
+                        # offset = idx - start_node
+                        body.append(("valu", ("-", v_offset, v_idx_curr, v_start_node)))
 
-                        next_layer = []
-                        for j in range(len(current_layer)//2):
-                            left = current_layer[2*j+1]
-                            right = current_layer[2*j]
-                            res = tree_temps[d][j]
-                            body.append(("flow", ("vselect", res, v_bit, left, right)))
-                            next_layer.append(res)
-                        current_layer = next_layer
+                        # Tree construction
+                        current_layer = level_vecs
+                        v_bit = temps['v_bits']
+                        for d in range(level):
+                            v_shift = self.scratch_const_vec(d)
+                            body.append(("valu", (">>", v_bit, v_offset, v_shift)))
+                            body.append(("valu", ("&", v_bit, v_bit, v_one)))
 
-                    # Final result is current_layer[0]
-                    # Copy to v_node_val? Or alias?
-                    # We can move it. Or just use it in Hash.
-                    # But Hash expects v_node_val.
-                    # Copy: valu + 0?
-                    # Or just:
-                    body.append(("valu", ("+", v_node_val, current_layer[0], v_zero)))
+                            next_layer = []
+                            for j in range(len(current_layer)//2):
+                                left = current_layer[2*j+1]
+                                right = current_layer[2*j]
+                                res = tree_temps[j]
+                                body.append(("flow", ("vselect", res, v_bit, left, right)))
+                                next_layer.append(res)
+                            current_layer = next_layer
 
-                else:
-                    body.append(("valu", ("+", v_addr, v_forest_base, v_idx_curr)))
-                    for k in range(VLEN):
-                        body.append(("load", ("load_offset", v_node_val, v_addr, k)))
+                        # Final result is current_layer[0]
+                        body.append(("valu", ("+", v_node_val, current_layer[0], v_zero)))
 
-                # Hash
-                body.append(("valu", ("^", v_val_curr, v_val_curr, v_node_val)))
-                body.extend(self.build_hash_vec(v_val_curr, v_tmp1, v_tmp2))
+                    else:
+                        body.append(("valu", ("+", v_addr, v_forest_base, v_idx_curr)))
+                        for k in range(VLEN):
+                            body.append(("load", ("load_offset", v_node_val, v_addr, k)))
 
-                # Update idx
-                body.append(("valu", ("&", v_tmp1, v_val_curr, v_one)))
-                body.append(("valu", ("==", v_tmp1, v_tmp1, v_zero)))
-                body.append(("flow", ("vselect", v_tmp3, v_tmp1, v_one, v_two)))
-                body.append(("valu", ("*", v_idx_curr, v_idx_curr, v_two)))
-                body.append(("valu", ("+", v_idx_curr, v_idx_curr, v_tmp3)))
+                    # Hash
+                    body.append(("valu", ("^", v_val_curr, v_val_curr, v_node_val)))
+                    body.extend(self.build_hash_vec(v_val_curr, v_tmp1, v_tmp2))
 
-                # Wrap
-                body.append(("valu", ("<", v_tmp1, v_idx_curr, v_n_nodes)))
-                body.append(("flow", ("vselect", v_idx_curr, v_tmp1, v_idx_curr, v_zero)))
+                    # Update idx
+                    body.append(("valu", ("&", v_tmp1, v_val_curr, v_one)))
+                    body.append(("valu", ("==", v_tmp1, v_tmp1, v_zero)))
+                    # body.append(("flow", ("vselect", v_tmp3, v_tmp1, v_one, v_two)))
+                    body.append(("valu", ("-", v_tmp3, v_two, v_tmp1))) # Optimized: 2 - is_even
+                    body.append(("valu", ("*", v_idx_curr, v_idx_curr, v_two)))
+                    body.append(("valu", ("+", v_idx_curr, v_idx_curr, v_tmp3)))
 
-        # Store Back
-        body.append(("flow", ("add_imm", curr_indices_p, self.scratch["inp_indices_p"], 0)))
-        body.append(("flow", ("add_imm", curr_values_p, self.scratch["inp_values_p"], 0)))
-        for i in range(len(hoisted_idx)):
-             body.append(("store", ("vstore", curr_indices_p, hoisted_idx[i])))
-             body.append(("store", ("vstore", curr_values_p, hoisted_val[i])))
-             body.append(("flow", ("add_imm", curr_indices_p, curr_indices_p, VLEN)))
-             body.append(("flow", ("add_imm", curr_values_p, curr_values_p, VLEN)))
+                    # Wrap
+                    body.append(("valu", ("<", v_tmp1, v_idx_curr, v_n_nodes)))
+                    # body.append(("flow", ("vselect", v_idx_curr, v_tmp1, v_idx_curr, v_zero)))
+                    body.append(("valu", ("-", v_tmp1, v_zero, v_tmp1))) # mask = 0 - (idx < n)
+                    body.append(("valu", ("&", v_idx_curr, v_idx_curr, v_tmp1)))
+
+            # Store Back
+            for i in range(current_tile_size):
+                 body.append(("store", ("vstore", store_indices_p, hoisted_idx[i])))
+                 body.append(("store", ("vstore", store_values_p, hoisted_val[i])))
+                 body.append(("flow", ("add_imm", store_indices_p, store_indices_p, VLEN)))
+                 body.append(("flow", ("add_imm", store_values_p, store_values_p, VLEN)))
 
         body.append(("flow", ("pause",)))
 
