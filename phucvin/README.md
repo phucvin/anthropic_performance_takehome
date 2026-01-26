@@ -34,3 +34,22 @@ The goal was to optimize a kernel that traverses a random forest and hashes valu
 
 -   **Parallelism vs Resource Constraints**: The primary bottleneck was the limited scratch space (1536 words). This constrained the ability to unroll loops further or cache more of the tree. Tiling was a crucial strategy to balance register usage with parallelism.
 -   **Load Throughput**: The dual load units were heavily utilized. Further optimization would likely require more aggressive caching strategies if scratch space permitted.
+
+### Further Optimizations (Jules)
+
+1.  **Hash Function Optimization**:
+    -   Identified pattern `(a + C) + (a << S)` in 3 out of 6 hash stages.
+    -   Optimized these stages to use `multiply_add` instruction (`dest = a * K + C` where `K = 1 + 2^S`).
+    -   This reduced VALU operation count for the hash function by ~33%, relieving the VALU bottleneck.
+
+2.  **Tree Caching with Ping-Pong Buffers**:
+    -   Enabled caching for Level 0 and Level 1 (`CACHE_LEVELS=2`).
+    -   Implemented "ALU Select" logic to replace expensive `vselect` (flow) or `load` operations for cached levels.
+    -   Used ping-pong buffers (`tree_temps_A` and `tree_temps_B`) to avoid register aliasing and allow parallel reduction in the selection tree.
+    -   Optimized scratch usage to fit `NUM_SETS=8` with `CACHE_LEVELS=2`.
+
+### Updated Results
+
+-   **Previous Solution**: 2484 cycles
+-   **Current Solution**: 2147 cycles
+-   **Speedup**: ~68.8x (vs Baseline) / ~1.16x (vs Previous)

@@ -198,6 +198,13 @@ class KernelBuilder:
         # Pre-broadcast hash constants
         consts_vec = {}
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+             # Check for multiply_add optimization: (a + C) + (a << S)
+             if op1 == "+" and op2 == "+" and op3 == "<<":
+                 K = (1 + (1 << val3))
+                 if K not in consts_vec: consts_vec[K] = self.scratch_const_vec(K)
+                 if val1 not in consts_vec: consts_vec[val1] = self.scratch_const_vec(val1)
+                 continue
+
              if val1 not in consts_vec: consts_vec[val1] = self.scratch_const_vec(val1)
              if val3 not in consts_vec: consts_vec[val3] = self.scratch_const_vec(val3)
              # Also need shift amounts as vectors for <<, >>
@@ -205,9 +212,14 @@ class KernelBuilder:
              if op3 in ("<<", ">>") and val3 not in consts_vec: consts_vec[val3] = self.scratch_const_vec(val3)
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("valu", (op1, tmp1, val_hash_addr, consts_vec[val1])))
-            slots.append(("valu", (op3, tmp2, val_hash_addr, consts_vec[val3])))
-            slots.append(("valu", (op2, val_hash_addr, tmp1, tmp2)))
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                 # Optimization: a = a * K + C
+                 K = (1 + (1 << val3))
+                 slots.append(("valu", ("multiply_add", val_hash_addr, val_hash_addr, consts_vec[K], consts_vec[val1])))
+            else:
+                slots.append(("valu", (op1, tmp1, val_hash_addr, consts_vec[val1])))
+                slots.append(("valu", (op3, tmp2, val_hash_addr, consts_vec[val3])))
+                slots.append(("valu", (op2, val_hash_addr, tmp1, tmp2)))
 
         return slots
 
@@ -242,7 +254,7 @@ class KernelBuilder:
 
         # Load cached forest nodes (levels 0 to 3)
         # 1+2+4+8 = 15 nodes.
-        CACHE_LEVELS = 0
+        CACHE_LEVELS = 2
 
         forest_scratch_base = self.scratch_ptr
         total_cached_nodes = max(0, 2**(CACHE_LEVELS) - 1)
@@ -298,7 +310,10 @@ class KernelBuilder:
              t['v_bits'] = self.alloc_scratch(f"v_bit_s{s}", VLEN)
 
              max_width = 2**(CACHE_LEVELS - 1) if CACHE_LEVELS > 0 else 0
-             t['tree_temps'] = [self.alloc_scratch(f"tree_tmp_{j}_s{s}", VLEN) for j in range(max_width)]
+             # Allocate two buffers for ping-pong tree reduction
+             # Buf A needs max_width, Buf B needs max_width/2
+             t['tree_temps_A'] = [self.alloc_scratch(f"tree_tmp_A_{j}_s{s}", VLEN) for j in range(max_width)]
+             t['tree_temps_B'] = [self.alloc_scratch(f"tree_tmp_B_{j}_s{s}", VLEN) for j in range(max_width // 2)]
              temp_sets.append(t)
 
         chunk_temps = [temp_sets[i % NUM_SETS] for i in range(TILE_VECS)]
@@ -347,26 +362,52 @@ class KernelBuilder:
                     if is_cached:
                         v_offset = temps['v_offset']
                         v_bits = temps['v_bits']
-                        tree_temps = temps['tree_temps']
                         # offset = idx - start_node
                         body.append(("valu", ("-", v_offset, v_idx_curr, v_start_node)))
 
                         # Tree construction
                         current_layer = level_vecs
                         v_bit = temps['v_bits']
+
+                        # Use ping-pong buffers
+                        buf_A = temps['tree_temps_A']
+                        buf_B = temps['tree_temps_B']
+                        # Assuming Level 4 (depth 4):
+                        # d=0 (16->8): In: level_vecs, Out: buf_A (8)
+                        # d=1 (8->4):  In: buf_A,      Out: buf_B (4)
+                        # d=2 (4->2):  In: buf_B,      Out: buf_A (2)
+                        # d=3 (2->1):  In: buf_A,      Out: buf_B (1)
+                        # Result in buf_B[0]
+
+                        use_buf_A_output = True # Start writing to A
+
                         for d in range(level):
                             v_shift = self.scratch_const_vec(d)
                             body.append(("valu", (">>", v_bit, v_offset, v_shift)))
                             body.append(("valu", ("&", v_bit, v_bit, v_one)))
+                            # Create mask: 0 - bit. If bit is 1 -> -1 (FFFF), if 0 -> 0
+                            body.append(("valu", ("-", v_bit, v_zero, v_bit)))
 
                             next_layer = []
+                            out_buf = buf_A if use_buf_A_output else buf_B
+
                             for j in range(len(current_layer)//2):
                                 left = current_layer[2*j+1]
                                 right = current_layer[2*j]
-                                res = tree_temps[j]
-                                body.append(("flow", ("vselect", res, v_bit, left, right)))
+                                res = out_buf[j]
+
+                                # alu_select: res = right ^ ((left ^ right) & mask)
+                                # Since res does not alias left or right (different buffers), we can do:
+                                # 1. res = left ^ right
+                                # 2. res = res & mask
+                                # 3. res = res ^ right
+                                body.append(("valu", ("^", res, left, right)))
+                                body.append(("valu", ("&", res, res, v_bit)))
+                                body.append(("valu", ("^", res, res, right)))
                                 next_layer.append(res)
+
                             current_layer = next_layer
+                            use_buf_A_output = not use_buf_A_output
 
                         # Final result is current_layer[0]
                         body.append(("valu", ("+", v_node_val, current_layer[0], v_zero)))
